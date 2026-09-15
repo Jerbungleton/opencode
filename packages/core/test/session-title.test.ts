@@ -23,6 +23,7 @@ import { SessionRunnerModel } from "@opencode/core/session/runner/model"
 import { SessionTable } from "@opencode/core/session/sql"
 import { SessionStore } from "@opencode/core/session/store"
 import { SessionTitle } from "@opencode/core/session/title"
+import { IdentityPlugin } from "@opencode/core/plugin/identity"
 import { PluginHooks } from "@opencode/core/plugin/hooks"
 import { PluginSupervisor } from "@opencode/core/plugin/supervisor"
 import { Location } from "@opencode/core/location"
@@ -36,6 +37,7 @@ import { AbsolutePath } from "@opencode/core/schema"
 import { Money } from "@opencode/schema/money"
 import { Deferred, Effect, Fiber, Layer, Stream } from "effect"
 import { testEffect } from "./lib/effect"
+import { host, modelHost } from "./plugin/host"
 
 let requests: LLMRequest[] = []
 let selectedSmall: Model.Info | undefined
@@ -50,6 +52,7 @@ const smallModel = LanguageModel.make({
   provider: "test",
   route: OpenAIChat.route,
 })
+const titleIdentity = "You are powered by title-model (test/title-model)."
 const cost = [
   {
     input: Money.USDPerMillionTokens.make(1),
@@ -102,6 +105,7 @@ const models = Layer.mock(SessionRunnerModel.Service)({
 })
 const smallModels = Layer.mock(Model.Service, {
   small: () => Effect.succeed(selectedSmall),
+  available: () => Effect.succeed([]),
 })
 const it = testEffect(
   AppNodeBuilder.build(
@@ -111,6 +115,7 @@ const it = testEffect(
       SessionProjector.node,
       SessionStore.node,
       Agent.node,
+      Model.node,
       PluginHooks.node,
       SessionTitle.node,
     ]),
@@ -198,9 +203,20 @@ const enableTitleAgent = Effect.gen(function* () {
   })
 })
 
+const enableIdentity = Effect.gen(function* () {
+  const models = yield* Model.Service
+  const hooks = yield* PluginHooks.Service
+  const pluginHost = host({
+    model: modelHost(models),
+    session: { hook: (name, callback) => hooks.register("session", name, callback) },
+  })
+  yield* IdentityPlugin.Plugin.effect(pluginHost)
+})
+
 it.effect("generates a title from the sole user message and renames the session", () =>
   Effect.gen(function* () {
     yield* enableTitleAgent
+    yield* enableIdentity
     const sessionID = Session.ID.make("ses_title_generate")
     yield* insertSession(sessionID)
     yield* prompt(sessionID, "Help me debug the failing build")
@@ -220,7 +236,7 @@ it.effect("generates a title from the sole user message and renames the session"
     })
     expect(requests[0]?.promptCacheKey).toBe(sessionID)
     expect(requests[0]?.tools).toEqual([])
-    expect(requests[0]?.system.map((part) => part.text)).toEqual(["You are a title generator."])
+    expect(requests[0]?.system.map((part) => part.text)).toEqual(["You are a title generator.", titleIdentity])
     expect(JSON.stringify(requests[0]?.messages)).toContain("Help me debug the failing build")
     const renamed = yield* store.get(sessionID)
     expect(renamed?.title).toBe("Generated Title")
@@ -232,6 +248,7 @@ it.effect("generates a title from the sole user message and renames the session"
 it.effect("runs title hooks instead of context hooks", () =>
   Effect.gen(function* () {
     yield* enableTitleAgent
+    yield* enableIdentity
     const sessionID = Session.ID.make("ses_title_hook")
     yield* insertSession(sessionID)
     yield* prompt(sessionID, "Redact this message")
@@ -242,7 +259,7 @@ it.effect("runs title hooks instead of context hooks", () =>
     yield* hooks.register("session", "title", (event) =>
       Effect.sync(() => {
         expect(event.sessionID).toBe(sessionID)
-        expect(event.system.map((part) => part.text)).toEqual(["You are a title generator."])
+        expect(event.system.map((part) => part.text)).toEqual(["You are a title generator.", titleIdentity])
         event.system.push(SystemPart.make("Prefer short titles."))
         event.messages = [Message.user("[redacted]")]
         event.options.maxTokens = 32
@@ -255,7 +272,7 @@ it.effect("runs title hooks instead of context hooks", () =>
 
     expect(contexts).toBe(0)
     expect(requests).toHaveLength(1)
-    expect(requests[0]?.system.map((part) => part.text)).toEqual(["You are a title generator.", "Prefer short titles."])
+    expect(requests[0]?.system.map((part) => part.text)).toEqual(["You are a title generator.", titleIdentity, "Prefer short titles."])
     expect(JSON.stringify(requests[0]?.messages)).not.toContain("Redact this message")
     expect(requests[0]?.generation).toEqual(expect.objectContaining({ maxTokens: 32 }))
     expect(requests[0]?.providerOptions).toEqual({ reasoningEffort: "low" })
@@ -431,6 +448,7 @@ it.effect("does not generate when the title agent is removed", () =>
 it.effect("regenerates an existing title using the title agent", () =>
   Effect.gen(function* () {
     yield* enableTitleAgent
+    yield* enableIdentity
     const sessionID = Session.ID.make("ses_title_regenerate")
     yield* insertSession(sessionID, "Original title")
     yield* prompt(sessionID, "Investigate the login failure")
@@ -463,7 +481,7 @@ it.effect("regenerates an existing title using the title agent", () =>
 
     const store = yield* SessionStore.Service
     expect(requests).toHaveLength(1)
-    expect(requests[0]?.system.map((part) => part.text)).toEqual(["You are a title generator."])
+    expect(requests[0]?.system.map((part) => part.text)).toEqual(["You are a title generator.", titleIdentity])
     expect(JSON.stringify(requests[0]?.messages)).toContain("Investigate the login failure")
     expect(JSON.stringify(requests[0]?.messages)).toContain("The actual issue is expired OAuth credentials.")
     expect(JSON.stringify(requests[0]?.messages)).toContain("Switch to fixing OAuth token refresh")
